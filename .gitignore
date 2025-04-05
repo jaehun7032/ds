@@ -9,3 +9,6 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
+
+# 환경변수 제외
+#.env
