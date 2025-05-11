@@ -1,0 +1,19 @@
+# Python 관련
+__pycache__/
+*.pyc
+
+# 환경 변수 파일
+.env
+
+# 에디터/IDE 관련
+.vscode/
+.idea/
+
+# 로그 및 캐시
+*.log
+
+# 데이터베이스
+*.sqlite3
+
+# 기타
+.DS_Store
