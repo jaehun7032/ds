@@ -1,4 +1,4 @@
-from itsdangerous import URLSafeTimedSerializer
+from itsdangerous import URLSafeTimedSerializer, SignatureExpired
 from flask import Blueprint, render_template, request, redirect, url_for, session, flash
 from flask_login import login_user, logout_user, login_required, current_user
 from flask_pymongo import PyMongo
@@ -14,6 +14,7 @@ import re
 oauth = None
 serializer = None
 auth_bp = Blueprint('auth', __name__)
+
 
 def init_auth(app):
     global mongo, bcrypt, oauth, serializer
@@ -41,11 +42,13 @@ def init_auth(app):
         client_kwargs={'scope': 'profile_nickname profile_image'}
     )
 
+
 @auth_bp.route("/")
 def home():
     if current_user.is_authenticated:
         return redirect(url_for("auth.dashboard"))
     return redirect(url_for("auth.login"))
+
 
 @auth_bp.route("/register", methods=["GET", "POST"])
 def register():
@@ -73,7 +76,7 @@ def register():
 
         hashed_password = bcrypt.generate_password_hash(password).decode("utf-8")
         token = serializer.dumps(username, salt='email-confirm')
-        verify_link = url_for('auth.verify_email', token=token, _external=True)
+        verify_link = url_for('auth.confirm_email', token=token, _external=True)
 
         msg = Message(
             subject="회원가입 이메일 인증",
@@ -96,29 +99,23 @@ def register():
 
     return render_template("register.html")
 
-@auth_bp.route("/verify/<token>")
-def verify_email(token):
-    try:
-        username = serializer.loads(token, salt='email-confirm', max_age=3600)
-    except Exception:
-        return "유효하지 않거나 만료된 토큰입니다."
-
-    mongo.db.users.update_one({"username": username}, {"$set": {"is_verified": True}})
-    return "이메일 인증이 완료되었습니다. 이제 로그인하실 수 있습니다."
 
 @auth_bp.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
         username = request.form["username"]
         password = request.form["password"]
+
         user_data = mongo.db.users.find_one({"username": username})
 
         if not user_data:
             flash("존재하지 않는 사용자입니다.", "danger")
             return redirect(url_for("auth.login"))
+
         if not user_data.get("is_verified", False):
-            flash("이메일 인증이 완료되지 않았습니다.", "danger")
-            return redirect(url_for("auth.login"))
+            flash("이메일 인증이 필요합니다. 재인증을 진행해주세요.", "warning")
+            return redirect(url_for("auth.resend_verification", email=username))
+
         if not bcrypt.check_password_hash(user_data["password"], password):
             flash("비밀번호가 틀렸습니다.", "danger")
             return redirect(url_for("auth.login"))
@@ -130,6 +127,44 @@ def login():
         return redirect(url_for("auth.dashboard"))
 
     return render_template("login.html")
+
+
+@auth_bp.route("/verify/<token>")
+def confirm_email(token):
+    try:
+        email = serializer.loads(token, salt="email-confirm", max_age=3600)
+    except SignatureExpired:
+        flash("인증 링크가 만료되었습니다. 재인증이 필요합니다.", "danger")
+        return redirect(url_for("auth.resend_verification"))
+
+    user = mongo.db.users.find_one({"username": email})
+    if user:
+        mongo.db.users.update_one({"username": email}, {"$set": {"is_verified": True}})
+        flash("이메일 인증이 완료되었습니다 ✅", "success")
+    return redirect(url_for("auth.login"))
+
+
+@auth_bp.route("/resend-verification", methods=["GET", "POST"])
+def resend_verification():
+    if request.method == "POST":
+        email = request.form["email"]
+        user = mongo.db.users.find_one({"username": email})
+        if user and not user.get("is_verified", False):
+            token = serializer.dumps(email, salt="email-confirm")
+            confirm_url = url_for("auth.confirm_email", token=token, _external=True)
+            msg = Message(
+                subject="이메일 인증 다시 받기",
+                sender=os.environ.get("MAIL_USERNAME"),  # 반드시 추가!
+                recipients=[email]
+            )
+            msg.body = f"다시 인증하려면 아래 링크를 클릭하세요:\n\n{confirm_url}"
+            mail.send(msg)
+
+            flash("인증 이메일이 재전송되었습니다 📩", "info")
+        else:
+            flash("이메일이 이미 인증되었거나 존재하지 않습니다.", "warning")
+    return render_template("resend_verification.html")
+
 
 @auth_bp.route("/forgot", methods=["GET", "POST"])
 def forgot_password():
@@ -154,6 +189,7 @@ def forgot_password():
 
     return render_template("forgot_password.html")
 
+
 @auth_bp.route("/reset/<token>", methods=["GET", "POST"])
 def reset_password(token):
     try:
@@ -162,12 +198,8 @@ def reset_password(token):
         return "유효하지 않거나 만료된 토큰입니다."
 
     if request.method == "POST":
-        new_password = request.form.get("new_password")
-        confirm_password = request.form.get("confirm_password")
-
-        # None일 경우를 대비한 기본값 처리
-        new_password = new_password.strip() if new_password else ""
-        confirm_password = confirm_password.strip() if confirm_password else ""
+        new_password = request.form.get("new_password", "").strip()
+        confirm_password = request.form.get("confirm_password", "").strip()
 
         if not new_password or not confirm_password:
             flash("모든 필드를 입력해주세요.", "danger")
@@ -196,6 +228,7 @@ def logout():
     session.pop("user_id", None)
     return redirect(url_for("auth.login"))
 
+
 @auth_bp.route("/dashboard")
 @login_required
 def dashboard():
@@ -209,12 +242,15 @@ def dashboard():
         project["card_count"] = card_count
         project_list.append(project)
 
-    return render_template("dashboard.html", user={"_id": str(current_user.id), "username": current_user.username}, projects=project_list)
+    return render_template("dashboard.html", user={"_id": str(current_user.id), "username": current_user.username},
+                           projects=project_list)
+
 
 @auth_bp.route("/login/<provider>")
 def oauth_login(provider):
     redirect_uri = url_for("auth.oauth_callback", provider=provider, _external=True)
     return oauth.create_client(provider).authorize_redirect(redirect_uri)
+
 
 @auth_bp.route("/callback/<provider>")
 def oauth_callback(provider):
